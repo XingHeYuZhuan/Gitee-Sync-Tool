@@ -32,7 +32,7 @@ jobs:
         SOURCE_GH_FULL_REPO="${SOURCE_GH_OWNER}/${SOURCE_GH_REPO_NAME}"
         
         # 获取 Gitee 已有的 Release 标签
-        GITEE_TAGS=$(curl -s -X GET "https://gitee.com/com/api/v5/repos/${GITEE_OWNER}/${GITEE_REPO}/releases?access_token=${GITEE_TOKEN}&per_page=100" | jq -r '.[].tag_name')
+        GITEE_TAGS=$(curl -s -X GET "https://gitee.com/api/v5/repos/${GITEE_OWNER}/${GITEE_REPO}/releases?access_token=${GITEE_TOKEN}&per_page=100" | jq -r '.[].tag_name')
         
         declare -A SYNCED_TAG_MAP
         while IFS= read -r TAG; do
