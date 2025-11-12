@@ -32,10 +32,10 @@ jobs:
         SOURCE_GH_FULL_REPO="${SOURCE_GH_OWNER}/${SOURCE_GH_REPO_NAME}"
         
         # 获取 Gitee 已有的 Release 标签和 ID
-        GITEE_RELEASES=$(curl -s -X GET "https://gitee.com/api/v5/repos/${GITEE_OWNER}/${GITEE_REPO}/releases?access_token=${GITEE_TOKEN}&per_page=100")
+        GITEE_RELEASES=$(curl -s -X GET "https://gitee.com/api/v5/repos/${GITEE_OWNER}/${GITEE_REPO}/releases?access_token=${GITEE_TOKEN}&per_page=100" | jq -r '.[].tag_name') # 修复了上一轮的 ID 提取方式，只提取 tag name 用于映射
         
         declare -A SYNCED_TAG_MAP
-        # 建立标签到 Gitee Release ID 的映射
+        # 建立标签到 Gitee Release ID 的映射 (重新提取所有信息，避免解析问题)
         while IFS= read -r line; do
           TAG=$(echo "$line" | cut -d':' -f1)
           ID=$(echo "$line" | cut -d':' -f2)
@@ -43,7 +43,7 @@ jobs:
           if [ -n "$TAG" ]; then
             SYNCED_TAG_MAP["$TAG"]="$ID"
           fi
-        done < <(echo "$GITEE_RELEASES" | jq -r '.[] | "\(.tag_name):\(.id)"' | tr -d '\r')
+        done < <(curl -s -X GET "https://gitee.com/api/v5/repos/${GITEE_OWNER}/${GITEE_REPO}/releases?access_token=${GITEE_TOKEN}&per_page=100" | jq -r '.[] | "\(.tag_name):\(.id)"' | tr -d '\r')
 
         # 获取 GitHub Release 列表
         GH_RELEASES_JSON=$(curl -sL \
@@ -109,6 +109,7 @@ jobs:
               echo "-> 标签 $TAG 已同步 (ID: ${GITEE_RELEASE_ID})，正在更新描述/名称..."
               RESPONSE=$(curl -s -X PATCH "https://gitee.com/api/v5/repos/${GITEE_OWNER}/${GITEE_REPO}/releases/${GITEE_RELEASE_ID}" \
                 -d "access_token=${GITEE_TOKEN}" \
+                -d "tag_name=${tag_name}" \
                 -d "name=${name}" \
                 -d "body=${RELEASE_BODY}")
               
