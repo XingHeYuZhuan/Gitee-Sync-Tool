@@ -142,20 +142,28 @@ jobs:
         
         sync_assets() {
             local METADATA="$1"
-            # 使用 export 确保 RELEASE_ID 在 parallel 的子 shell 中可用
+            # 这里的 jq 应该能够正确解析，因为它收到了一个干净的 JSON 字符串
             export TAG_NAME=$(echo "$METADATA" | jq -r '.tag_name')
             export RELEASE_ID=$(echo "$METADATA" | jq -r '.gitee_id')
             local ASSET_URLS=$(echo "$METADATA" | jq -r '.asset_urls')
             local TEMP_DIR="assets_${TAG_NAME}"
             
+            # 🚨 增加一个检查，确保 ID 和 TAG 已经正确解析
+            if [ -z "$RELEASE_ID" ] || [ "$RELEASE_ID" == "null" ]; then
+                echo "::error::解析 Release ID 失败，跳过同步。原始元数据: $METADATA" >&2
+                return 1
+            fi
+            
             echo "--- 开始同步 ${TAG_NAME} (ID: ${RELEASE_ID}) 的附件 ---" >&2
             
-            # --- 0. [新增] 覆盖逻辑：先删除 Gitee 上的旧附件 ---
+            # --- 0. 覆盖逻辑：先删除 Gitee 上的旧附件 ---
             echo "正在清理 Gitee 旧附件..." >&2
             GITEE_ASSETS=$(curl -s -X GET "https://gitee.com/api/v5/repos/${GITEE_OWNER}/${GITEE_REPO}/releases/${RELEASE_ID}/attach_files?access_token=${GITEE_TOKEN}")
             
-            if echo "$GITEE_ASSETS" | jq -e '.[0]' > /dev/null; then
+            # 使用更安全的 jq 解析来判断是否为空数组
+            if echo "$GITEE_ASSETS" | jq -e '. | type == "array" and length > 0' > /dev/null; then
                 echo "$GITEE_ASSETS" | jq -r '.[].id' | while IFS= read -r ASSET_ID; do
+                    # 使用 -s 静默模式，只关注返回码
                     curl -s -X DELETE "https://gitee.com/api/v5/repos/${GITEE_OWNER}/${GITEE_REPO}/releases/${RELEASE_ID}/attach_files/${ASSET_ID}?access_token=${GITEE_TOKEN}" > /dev/null
                 done
                 echo "旧附件清理完成。" >&2
@@ -165,7 +173,7 @@ jobs:
 
             # 1. 下载附件
             mkdir -p "${TEMP_DIR}"
-            if [ -z "$ASSET_URLS" ]; then
+            if [ -z "$ASSET_URLS" ] || [ "$ASSET_URLS" == "null" ]; then
                 echo "GitHub Release 没有附件，跳过下载/上传。" >&2
             else
                 echo "$ASSET_URLS" | tr '|' '\n' | while IFS= read -r ASSET_URL; do
@@ -180,7 +188,7 @@ jobs:
                 upload_file() {
                   local FILE="$1"
                   echo "Uploading $FILE..." >&2
-                  # RELEASE_ID 现在作为导出的环境变量可用
+                  # RELEASE_ID 已经通过 export 确保在 parallel 的子 shell 中可用
                   RESPONSE=$(curl -s -X POST "https://gitee.com/api/v5/repos/${GITEE_OWNER}/${GITEE_REPO}/releases/${RELEASE_ID}/attach_files" \
                     -F "access_token=${GITEE_TOKEN}" \
                     -F "file=@${FILE}")
@@ -207,8 +215,8 @@ jobs:
         export GITEE_REPO=${GITEE_REPO}
 
         echo "--- 启动附件并行同步 ---"
-        # 关键：使用 parallel 并行处理多个 Release 的附件同步任务
-        cat "$METADATA_FILE" | parallel -j 5 sync_assets "{}"
+        # 🚨 修正：清理换行符和空行，确保 parallel 接收到干净的 JSON 行
+        cat "$METADATA_FILE" | tr -d '\r' | grep . | parallel -j 5 sync_assets "{}"
         
         echo "所有附件同步完成。"
       shell: bash
