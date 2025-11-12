@@ -144,7 +144,7 @@ jobs:
         sync_assets() {
             local METADATA="$1"
             
-            # 🚨 修正：增加对元数据参数的清理，以防万一
+            # 增加对元数据参数的清理，以防万一
             local CLEAN_METADATA=$(echo "$METADATA" | tr -d '\r' | grep -v '^\s*$' | tr -d '\n')
             
             export TAG_NAME=$(echo "$CLEAN_METADATA" | jq -r '.tag_name')
@@ -162,7 +162,6 @@ jobs:
             
             # --- 0. 覆盖逻辑：先删除 Gitee 上的旧附件 ---
             echo "正在清理 Gitee 旧附件..." >&2
-            # 确保 RELEASE_ID 被正确使用
             GITEE_ASSETS=$(curl -s -X GET "https://gitee.com/api/v5/repos/${GITEE_OWNER}/${GITEE_REPO}/releases/${RELEASE_ID}/attach_files?access_token=${GITEE_TOKEN}")
             
             # 使用更安全的 jq 解析来判断是否为空数组
@@ -185,8 +184,8 @@ jobs:
                     if [ -z "$ASSET_URL" ]; then continue; fi
                     local FNAME=$(basename "$ASSET_URL")
                     echo "Downloading $FNAME..." >&2
-                    # 下载时使用 GitHub Token 认证
-                    curl -L -o "${TEMP_DIR}/${FNAME}" -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" "$ASSET_URL"
+                    # 🚨 关键修改 2：使用导出的环境变量 GITHUB_TOKEN
+                    curl -L -o "${TEMP_DIR}/${FNAME}" -H "Authorization: token ${GITHUB_TOKEN}" "$ASSET_URL"
                 done
                 
                 # 2. 上传附件
@@ -218,6 +217,7 @@ jobs:
         export GITEE_TOKEN=${GITEE_TOKEN}
         export GITEE_OWNER=${GITEE_OWNER}
         export GITEE_REPO=${GITEE_REPO}
+        export GITHUB_TOKEN=${{ secrets.GITHUB_TOKEN }}
 
         echo "--- 启动附件并行同步 ---"
         # 使用 tr -d '\r' 清理 Windows 换行符，使用 grep . 过滤空行
