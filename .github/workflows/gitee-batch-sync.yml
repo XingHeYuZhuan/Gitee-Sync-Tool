@@ -1,0 +1,168 @@
+name: Gitee Sync (Manual Batch)
+
+on:
+  # 允许手动触发
+  workflow_dispatch:
+
+env:
+  GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+  GITEE_OWNER: ${{ vars.GITEE_OWNER }}
+  GITEE_REPO: ${{ vars.GITEE_REPO }}
+  GITEE_TARGET_COMMITISH: ${{ vars.GITEE_TARGET_COMMITISH }}
+  
+  # 被同步的 GitHub 仓库信息
+  SOURCE_GH_OWNER: ${{ vars.SOURCE_GH_OWNER }}
+  SOURCE_GH_REPO_NAME: ${{ vars.SOURCE_GH_REPO_NAME }}
+
+jobs:
+  sync-all-unsynced:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Set up dependencies
+      run: |
+        sudo apt-get update
+        # 安装 jq 和 parallel (用于附件并行上传)
+        sudo apt-get install -y jq parallel
+      shell: bash
+
+    - name:  阶段一：识别未同步版本并按序创建 Gitee Release
+      id: creation_phase
+      run: |
+        SOURCE_GH_FULL_REPO="${SOURCE_GH_OWNER}/${SOURCE_GH_REPO_NAME}"
+        
+        # 获取 Gitee 已有的 Release 标签
+        GITEE_TAGS=$(curl -s -X GET "https://gitee.com/com/api/v5/repos/${GITEE_OWNER}/${GITEE_REPO}/releases?access_token=${GITEE_TOKEN}&per_page=100" | jq -r '.[].tag_name')
+        
+        declare -A SYNCED_TAG_MAP
+        while IFS= read -r TAG; do
+            SYNCED_TAG_MAP["$TAG"]=1
+        done <<< "$GITEE_TAGS"
+
+        # 获取 GitHub Release 列表
+        GH_RELEASES_JSON=$(curl -sL \
+          -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+          -H "Accept: application/vnd.github.v3+json" \
+          "${GITHUB_API_URL}/repos/${SOURCE_GH_FULL_REPO}/releases?per_page=100")
+
+        # 关键：使用 jq 'reverse' 将标签按创建时间从最旧到最新排序
+        TAGS_TO_SYNC=()
+        while IFS= read -r TAG; do
+            if [[ -z "${SYNCED_TAG_MAP[$TAG]}" ]]; then
+                TAGS_TO_SYNC+=("$TAG")
+            fi
+        done < <(echo "$GH_RELEASES_JSON" | jq -r 'reverse | .[] | .tag_name')
+
+        if [ ${#TAGS_TO_SYNC[@]} -eq 0 ]; then
+            echo "所有 Release 均已同步，无需操作。"
+            echo "metadata_file=SKIP" >> $GITHUB_OUTPUT
+            exit 0
+        fi
+        
+        echo "--- 发现未同步标签 (从旧到新): ${#TAGS_TO_SYNC[@]} 个 ---"
+        printf "%s\n" "${TAGS_TO_SYNC[@]}"
+        
+        METADATA_FILE="RELEASE_METADATA.jsonl"
+        rm -f "$METADATA_FILE"
+
+        # 依次创建 Gitee Release (保证历史顺序)
+        for TAG in "${TAGS_TO_SYNC[@]}"; do
+          echo "-> 正在创建标签: $TAG"
+          
+          RELEASE_INFO=$(curl -sL \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "${GITHUB_API_URL}/repos/${SOURCE_GH_FULL_REPO}/releases/tags/${TAG}")
+
+          tag_name=$(echo "$RELEASE_INFO" | jq -r '.tag_name')
+          name=$(echo "$RELEASE_INFO" | jq -r '.name')
+          body=$(echo "$RELEASE_INFO" | jq -r '.body')
+          html_url=$(echo "$RELEASE_INFO" | jq -r '.html_url')
+          prerelease=$(echo "$RELEASE_INFO" | jq -r '.prerelease')
+          
+          RELEASE_BODY="${body}
+GitHub Release: ${html_url}"
+          
+          RESPONSE=$(curl -s -X POST "https://gitee.com/api/v5/repos/${GITEE_OWNER}/${GITEE_REPO}/releases" \
+            -d "access_token=${GITEE_TOKEN}" \
+            -d "tag_name=${tag_name}" \
+            -d "name=${name}" \
+            -d "body=${RELEASE_BODY}" \
+            -d "prerelease=${prerelease}" \
+            -d "target_commitish=${GITEE_TARGET_COMMITISH}")
+
+          release_id=$(echo "$RESPONSE" | jq -r '.id')
+          if [ "$release_id" == "null" ]; then
+              echo "::error::Gitee Release 创建失败 (${tag_name})，响应：$RESPONSE"
+              continue
+          fi
+          
+          ASSET_URLS=$(echo "$RELEASE_INFO" | jq -r '[.assets[] | .browser_download_url] | join("|")')
+          
+          # 将元数据写入文件供下一阶段并行使用
+          jq -n \
+            --arg tag "$tag_name" \
+            --arg id "$release_id" \
+            --arg urls "$ASSET_URLS" \
+            '{tag_name: $tag, gitee_id: $id, asset_urls: $urls}' >> "$METADATA_FILE"
+          
+          echo "创建成功，ID: $release_id"
+        done
+        
+        echo "metadata_file=$METADATA_FILE" >> $GITHUB_OUTPUT
+      shell: bash
+
+    - name:  阶段二：并行下载和上传附件
+      if: steps.creation_phase.outputs.metadata_file != 'SKIP'
+      run: |
+        METADATA_FILE="${{ steps.creation_phase.outputs.metadata_file }}"
+        
+        sync_assets() {
+            local METADATA="$1"
+            local TAG_NAME=$(echo "$METADATA" | jq -r '.tag_name')
+            local RELEASE_ID=$(echo "$METADATA" | jq -r '.gitee_id')
+            local ASSET_URLS=$(echo "$METADATA" | jq -r '.asset_urls')
+            local TEMP_DIR="assets_${TAG_NAME}"
+            
+            echo "--- 开始同步 ${TAG_NAME} (ID: ${RELEASE_ID}) 的附件 ---" >&2
+            
+            # 1. 下载附件
+            mkdir -p "${TEMP_DIR}"
+            echo "$ASSET_URLS" | tr '|' '\n' | while IFS= read -r ASSET_URL; do
+                if [ -z "$ASSET_URL" ]; then continue; fi
+                local FNAME=$(basename "$ASSET_URL")
+                echo "Downloading $FNAME..." >&2
+                # 下载时使用 GitHub Token 认证
+                curl -L -o "${TEMP_DIR}/${FNAME}" -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" "$ASSET_URL"
+            done
+            
+            # 2. 上传附件
+            upload_file() {
+              local FILE="$1"
+              echo "Uploading $FILE..." >&2
+              # 使用全局环境变量
+              curl -s -X POST "https://gitee.com/api/v5/repos/${GITEE_OWNER}/${GITEE_REPO}/releases/${RELEASE_ID}/attach_files" \
+                -F "access_token=${GITEE_TOKEN}" \
+                -F "file=@${FILE}" > /dev/null
+            }
+            export -f upload_file
+            
+            # 使用 GNU parallel 对该 Release 的所有附件进行并行上传
+            find "${TEMP_DIR}" -type f | parallel -j 5 upload_file
+            
+            # 3. 清理
+            rm -rf "${TEMP_DIR}"
+            echo "--- ${TAG_NAME} 附件同步完成 ---" >&2
+        }
+        export -f sync_assets
+
+        # 导出全局变量供 parallel 的子 shell 使用
+        export GITEE_TOKEN=${GITEE_TOKEN}
+        export GITEE_OWNER=${GITEE_OWNER}
+        export GITEE_REPO=${GITEE_REPO}
+
+        echo "--- 启动附件并行同步 ---"
+        cat "$METADATA_FILE" | parallel -j 5 sync_assets "{}"
+        
+        echo "所有附件同步完成。"
+      shell: bash
