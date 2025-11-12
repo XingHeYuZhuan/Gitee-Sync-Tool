@@ -26,7 +26,7 @@ jobs:
         sudo apt-get install -y jq parallel
       shell: bash
 
-    - name:  阶段一：识别未同步版本并按序创建 Gitee Release
+    - name: 阶段一：识别未同步版本并按序创建 Gitee Release
       id: creation_phase
       run: |
         SOURCE_GH_FULL_REPO="${SOURCE_GH_OWNER}/${SOURCE_GH_REPO_NAME}"
@@ -45,7 +45,7 @@ jobs:
           -H "Accept: application/vnd.github.v3+json" \
           "${GITHUB_API_URL}/repos/${SOURCE_GH_FULL_REPO}/releases?per_page=100")
 
-        # 关键：使用 jq 'reverse' 将标签按创建时间从最旧到最新排序
+        # 🚨 关键：使用 jq 'reverse' 将标签按创建时间从最旧到最新排序
         TAGS_TO_SYNC=()
         while IFS= read -r TAG; do
             if [[ -z "${SYNCED_TAG_MAP[$TAG]}" ]]; then
@@ -54,7 +54,7 @@ jobs:
         done < <(echo "$GH_RELEASES_JSON" | jq -r 'reverse | .[] | .tag_name')
 
         if [ ${#TAGS_TO_SYNC[@]} -eq 0 ]; then
-            echo "所有 Release 均已同步，无需操作。"
+            echo "✅ 所有 Release 均已同步，无需操作。"
             echo "metadata_file=SKIP" >> $GITHUB_OUTPUT
             exit 0
         fi
@@ -80,8 +80,8 @@ jobs:
           html_url=$(echo "$RELEASE_INFO" | jq -r '.html_url')
           prerelease=$(echo "$RELEASE_INFO" | jq -r '.prerelease')
           
-          RELEASE_BODY="${body}
-GitHub Release: ${html_url}"
+          RELEASE_BODY="${body} \
+          GitHub Release: ${html_url}"
           
           RESPONSE=$(curl -s -X POST "https://gitee.com/api/v5/repos/${GITEE_OWNER}/${GITEE_REPO}/releases" \
             -d "access_token=${GITEE_TOKEN}" \
@@ -112,7 +112,7 @@ GitHub Release: ${html_url}"
         echo "metadata_file=$METADATA_FILE" >> $GITHUB_OUTPUT
       shell: bash
 
-    - name:  阶段二：并行下载和上传附件
+    - name: 阶段二：并行下载和上传附件
       if: steps.creation_phase.outputs.metadata_file != 'SKIP'
       run: |
         METADATA_FILE="${{ steps.creation_phase.outputs.metadata_file }}"
@@ -162,6 +162,7 @@ GitHub Release: ${html_url}"
         export GITEE_REPO=${GITEE_REPO}
 
         echo "--- 启动附件并行同步 ---"
+        # 关键：使用 parallel 并行处理多个 Release 的附件同步任务
         cat "$METADATA_FILE" | parallel -j 5 sync_assets "{}"
         
         echo "所有附件同步完成。"
