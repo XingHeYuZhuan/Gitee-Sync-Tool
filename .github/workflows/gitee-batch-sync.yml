@@ -26,21 +26,24 @@ jobs:
         sudo apt-get install -y jq parallel
       shell: bash
 
-    - name: 阶段一：识别未同步版本并按序创建 Gitee Release
+    - name: 阶段一：识别并创建/更新 Gitee Release
       id: creation_phase
       run: |
         SOURCE_GH_FULL_REPO="${SOURCE_GH_OWNER}/${SOURCE_GH_REPO_NAME}"
         
-        # 获取 Gitee 已有的 Release 标签
-        GITEE_TAGS=$(curl -s -X GET "https://gitee.com/api/v5/repos/${GITEE_OWNER}/${GITEE_REPO}/releases?access_token=${GITEE_TOKEN}&per_page=100" | jq -r '.[].tag_name' | tr -d '\r')
+        # 获取 Gitee 已有的 Release 标签和 ID
+        GITEE_RELEASES=$(curl -s -X GET "https://gitee.com/api/v5/repos/${GITEE_OWNER}/${GITEE_REPO}/releases?access_token=${GITEE_TOKEN}&per_page=100")
         
         declare -A SYNCED_TAG_MAP
-        while IFS= read -r TAG; do
+        # 建立标签到 Gitee Release ID 的映射
+        while IFS= read -r line; do
+          TAG=$(echo "$line" | cut -d':' -f1)
+          ID=$(echo "$line" | cut -d':' -f2)
           TAG=$(echo "$TAG" | xargs)
           if [ -n "$TAG" ]; then
-            SYNCED_TAG_MAP["$TAG"]=1
+            SYNCED_TAG_MAP["$TAG"]="$ID"
           fi
-        done <<< "$GITEE_TAGS"
+        done < <(echo "$GITEE_RELEASES" | jq -r '.[] | "\(.tag_name):\(.id)"' | tr -d '\r')
 
         # 获取 GitHub Release 列表
         GH_RELEASES_JSON=$(curl -sL \
@@ -49,34 +52,29 @@ jobs:
           "${GITHUB_API_URL}/repos/${SOURCE_GH_FULL_REPO}/releases?per_page=100")
 
         # 🚨 关键：使用 jq 'reverse' 将标签按创建时间从最旧到最新排序
-        TAGS_TO_SYNC=()
+        TAGS_TO_PROCESS=()
         while IFS= read -r TAG; do
-            if [[ -z "${SYNCED_TAG_MAP[$TAG]}" ]]; then
-                TAGS_TO_SYNC+=("$TAG")
-            fi
+            TAGS_TO_PROCESS+=("$TAG")
         done < <(echo "$GH_RELEASES_JSON" | jq -r 'reverse | .[] | .tag_name')
 
-        if [ ${#TAGS_TO_SYNC[@]} -eq 0 ]; then
-            echo "✅ 所有 Release 均已同步，无需操作。"
+        if [ ${#TAGS_TO_PROCESS[@]} -eq 0 ]; then
+            echo "✅ 目标 GitHub 仓库没有 Release。"
             echo "metadata_file=SKIP" >> $GITHUB_OUTPUT
             exit 0
         fi
         
-        echo "--- 发现未同步标签 (从旧到新): ${#TAGS_TO_SYNC[@]} 个 ---"
-        printf "%s\n" "${TAGS_TO_SYNC[@]}"
+        echo "--- 发现待处理标签 (从旧到新): ${#TAGS_TO_PROCESS[@]} 个 ---"
+        printf "%s\n" "${TAGS_TO_PROCESS[@]}"
         
         METADATA_FILE="RELEASE_METADATA.jsonl"
         rm -f "$METADATA_FILE"
 
-        # 依次创建 Gitee Release (保证历史顺序)
-        for TAG in "${TAGS_TO_SYNC[@]}"; do
-          echo "-> 正在创建标签: $TAG"
+        # 依次创建/更新 Gitee Release (保证历史顺序)
+        for TAG in "${TAGS_TO_PROCESS[@]}"; do
+          echo "-> 正在处理标签: $TAG"
           
-          RELEASE_INFO=$(curl -sL \
-            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
-            -H "Accept: application/vnd.github.v3+json" \
-            "${GITHUB_API_URL}/repos/${SOURCE_GH_FULL_REPO}/releases/tags/${TAG}")
-
+          RELEASE_INFO=$(echo "$GH_RELEASES_JSON" | jq -c ".[] | select(.tag_name == \"${TAG}\")")
+          
           tag_name=$(echo "$RELEASE_INFO" | jq -r '.tag_name')
           name=$(echo "$RELEASE_INFO" | jq -r '.name')
           body=$(echo "$RELEASE_INFO" | jq -r '.body')
@@ -84,74 +82,117 @@ jobs:
           prerelease=$(echo "$RELEASE_INFO" | jq -r '.prerelease')
           
           RELEASE_BODY="${body} \
-          GitHub Release: ${html_url}"
+          \n\n**GitHub Release:** ${html_url}"
           
-          RESPONSE=$(curl -s -X POST "https://gitee.com/api/v5/repos/${GITEE_OWNER}/${GITEE_REPO}/releases" \
-            -d "access_token=${GITEE_TOKEN}" \
-            -d "tag_name=${tag_name}" \
-            -d "name=${name}" \
-            -d "body=${RELEASE_BODY}" \
-            -d "prerelease=${prerelease}" \
-            -d "target_commitish=${GITEE_TARGET_COMMITISH}")
+          GITEE_RELEASE_ID="${SYNCED_TAG_MAP[$TAG]}"
 
-          release_id=$(echo "$RESPONSE" | jq -r '.id')
-          if [ "$release_id" == "null" ]; then
-              echo "::error::Gitee Release 创建失败 (${tag_name})，响应：$RESPONSE"
-              continue
+          if [ -z "$GITEE_RELEASE_ID" ]; then
+              # --- 1. 创建 Release ---
+              echo "-> 标签 $TAG 尚未同步，正在创建 Release..."
+              RESPONSE=$(curl -s -X POST "https://gitee.com/api/v5/repos/${GITEE_OWNER}/${GITEE_REPO}/releases" \
+                -d "access_token=${GITEE_TOKEN}" \
+                -d "tag_name=${tag_name}" \
+                -d "name=${name}" \
+                -d "body=${RELEASE_BODY}" \
+                -d "prerelease=${prerelease}" \
+                -d "target_commitish=${GITEE_TARGET_COMMITISH}")
+                
+              release_id=$(echo "$RESPONSE" | jq -r '.id')
+              if [ "$release_id" == "null" ]; then
+                  echo "::error::Gitee Release 创建失败 (${tag_name})，响应：$RESPONSE"
+                  continue
+              fi
+              echo "创建成功，ID: $release_id"
+              GITEE_RELEASE_ID="$release_id"
+          else
+              # --- 2. 更新 Release (名称和描述) ---
+              echo "-> 标签 $TAG 已同步 (ID: ${GITEE_RELEASE_ID})，正在更新描述/名称..."
+              RESPONSE=$(curl -s -X PATCH "https://gitee.com/api/v5/repos/${GITEE_OWNER}/${GITEE_REPO}/releases/${GITEE_RELEASE_ID}" \
+                -d "access_token=${GITEE_TOKEN}" \
+                -d "name=${name}" \
+                -d "body=${RELEASE_BODY}")
+              
+              if ! echo "$RESPONSE" | jq -e '.id' > /dev/null; then
+                  echo "::error::Gitee Release 更新失败 (${tag_name})，响应：$RESPONSE"
+                  continue
+              fi
+              echo "更新成功，ID: $GITEE_RELEASE_ID"
           fi
           
+          # 附件 URL 列表 (用 "|" 连接)
           ASSET_URLS=$(echo "$RELEASE_INFO" | jq -r '[.assets[] | .browser_download_url] | join("|")')
           
           # 将元数据写入文件供下一阶段并行使用
           jq -n \
             --arg tag "$tag_name" \
-            --arg id "$release_id" \
+            --arg id "$GITEE_RELEASE_ID" \
             --arg urls "$ASSET_URLS" \
             '{tag_name: $tag, gitee_id: $id, asset_urls: $urls}' >> "$METADATA_FILE"
           
-          echo "创建成功，ID: $release_id"
         done
         
         echo "metadata_file=$METADATA_FILE" >> $GITHUB_OUTPUT
       shell: bash
 
-    - name: 阶段二：并行下载和上传附件
+    - name: 阶段二：并行下载和上传附件 (包含覆盖逻辑)
       if: steps.creation_phase.outputs.metadata_file != 'SKIP'
       run: |
         METADATA_FILE="${{ steps.creation_phase.outputs.metadata_file }}"
         
         sync_assets() {
             local METADATA="$1"
-            local TAG_NAME=$(echo "$METADATA" | jq -r '.tag_name')
-            local RELEASE_ID=$(echo "$METADATA" | jq -r '.gitee_id')
+            # 使用 export 确保 RELEASE_ID 在 parallel 的子 shell 中可用
+            export TAG_NAME=$(echo "$METADATA" | jq -r '.tag_name')
+            export RELEASE_ID=$(echo "$METADATA" | jq -r '.gitee_id')
             local ASSET_URLS=$(echo "$METADATA" | jq -r '.asset_urls')
             local TEMP_DIR="assets_${TAG_NAME}"
             
             echo "--- 开始同步 ${TAG_NAME} (ID: ${RELEASE_ID}) 的附件 ---" >&2
             
+            # --- 0. [新增] 覆盖逻辑：先删除 Gitee 上的旧附件 ---
+            echo "正在清理 Gitee 旧附件..." >&2
+            GITEE_ASSETS=$(curl -s -X GET "https://gitee.com/api/v5/repos/${GITEE_OWNER}/${GITEE_REPO}/releases/${RELEASE_ID}/attach_files?access_token=${GITEE_TOKEN}")
+            
+            if echo "$GITEE_ASSETS" | jq -e '.[0]' > /dev/null; then
+                echo "$GITEE_ASSETS" | jq -r '.[].id' | while IFS= read -r ASSET_ID; do
+                    curl -s -X DELETE "https://gitee.com/api/v5/repos/${GITEE_OWNER}/${GITEE_REPO}/releases/${RELEASE_ID}/attach_files/${ASSET_ID}?access_token=${GITEE_TOKEN}" > /dev/null
+                done
+                echo "旧附件清理完成。" >&2
+            else
+                echo "Gitee 上无旧附件需要清理。" >&2
+            fi
+
             # 1. 下载附件
             mkdir -p "${TEMP_DIR}"
-            echo "$ASSET_URLS" | tr '|' '\n' | while IFS= read -r ASSET_URL; do
-                if [ -z "$ASSET_URL" ]; then continue; fi
-                local FNAME=$(basename "$ASSET_URL")
-                echo "Downloading $FNAME..." >&2
-                # 下载时使用 GitHub Token 认证
-                curl -L -o "${TEMP_DIR}/${FNAME}" -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" "$ASSET_URL"
-            done
-            
-            # 2. 上传附件
-            upload_file() {
-              local FILE="$1"
-              echo "Uploading $FILE..." >&2
-              # 使用全局环境变量
-              curl -s -X POST "https://gitee.com/api/v5/repos/${GITEE_OWNER}/${GITEE_REPO}/releases/${RELEASE_ID}/attach_files" \
-                -F "access_token=${GITEE_TOKEN}" \
-                -F "file=@${FILE}" > /dev/null
-            }
-            export -f upload_file
-            
-            # 使用 GNU parallel 对该 Release 的所有附件进行并行上传
-            find "${TEMP_DIR}" -type f | parallel -j 5 upload_file
+            if [ -z "$ASSET_URLS" ]; then
+                echo "GitHub Release 没有附件，跳过下载/上传。" >&2
+            else
+                echo "$ASSET_URLS" | tr '|' '\n' | while IFS= read -r ASSET_URL; do
+                    if [ -z "$ASSET_URL" ]; then continue; fi
+                    local FNAME=$(basename "$ASSET_URL")
+                    echo "Downloading $FNAME..." >&2
+                    # 下载时使用 GitHub Token 认证
+                    curl -L -o "${TEMP_DIR}/${FNAME}" -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" "$ASSET_URL"
+                done
+                
+                # 2. 上传附件
+                upload_file() {
+                  local FILE="$1"
+                  echo "Uploading $FILE..." >&2
+                  # RELEASE_ID 现在作为导出的环境变量可用
+                  RESPONSE=$(curl -s -X POST "https://gitee.com/api/v5/repos/${GITEE_OWNER}/${GITEE_REPO}/releases/${RELEASE_ID}/attach_files" \
+                    -F "access_token=${GITEE_TOKEN}" \
+                    -F "file=@${FILE}")
+                  
+                  if echo "$RESPONSE" | grep -q '"message"'; then
+                      echo "::warning::附件上传失败 ($FILE)，响应：$RESPONSE" >&2
+                  fi
+                }
+                export -f upload_file
+                
+                # 使用 GNU parallel 对该 Release 的所有附件进行并行上传
+                find "${TEMP_DIR}" -type f | parallel -j 5 upload_file
+            fi
             
             # 3. 清理
             rm -rf "${TEMP_DIR}"
