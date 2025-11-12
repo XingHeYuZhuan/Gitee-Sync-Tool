@@ -81,7 +81,7 @@ jobs:
           html_url=$(echo "$RELEASE_INFO" | jq -r '.html_url')
           prerelease=$(echo "$RELEASE_INFO" | jq -r '.prerelease')
           
-          RELEASE_BODY="${body}
+          RELEASE_BODY="${body}"
           
           GITEE_RELEASE_ID="${SYNCED_TAG_MAP[$TAG]}"
 
