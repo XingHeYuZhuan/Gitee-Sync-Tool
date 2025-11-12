@@ -51,14 +51,14 @@ jobs:
           -H "Accept: application/vnd.github.v3+json" \
           "${GITHUB_API_URL}/repos/${SOURCE_GH_FULL_REPO}/releases?per_page=100")
 
-        # 🚨 关键：使用 jq 'reverse' 将标签按创建时间从最旧到最新排序
+        # 使用 jq 'reverse' 将标签按创建时间从最旧到最新排序
         TAGS_TO_PROCESS=()
         while IFS= read -r TAG; do
             TAGS_TO_PROCESS+=("$TAG")
         done < <(echo "$GH_RELEASES_JSON" | jq -r 'reverse | .[] | .tag_name')
 
         if [ ${#TAGS_TO_PROCESS[@]} -eq 0 ]; then
-            echo "✅ 目标 GitHub 仓库没有 Release。"
+            echo "目标 GitHub 仓库没有 Release。"
             echo "metadata_file=SKIP" >> $GITHUB_OUTPUT
             exit 0
         fi
@@ -123,7 +123,6 @@ jobs:
           ASSET_URLS=$(echo "$RELEASE_INFO" | jq -r '[.assets[] | .browser_download_url] | join("|")')
           
           # 将元数据写入文件供下一阶段并行使用
-          # 🚨 修正：使用 -c 选项强制输出紧凑的单行 JSON
           jq -n -c \
             --arg tag "$tag_name" \
             --arg id "$GITEE_RELEASE_ID" \
@@ -135,16 +134,16 @@ jobs:
         echo "metadata_file=$METADATA_FILE" >> $GITHUB_OUTPUT
       shell: bash
 
-    - name: 阶段二：串行下载和上传附件 (调试模式)
+    - name: 阶段二：并行下载和上传附件
       if: steps.creation_phase.outputs.metadata_file != 'SKIP'
       run: |
         METADATA_FILE="${{ steps.creation_phase.outputs.metadata_file }}"
         
+        # 定义同步函数
         sync_assets() {
             local METADATA="$1"
             
-            # 增加对元数据参数的清理，以防万一
-            # 串行模式下不需要太多清理，但保留以确保健壮性
+            # 清理元数据，确保 jq 解析成功
             local CLEAN_METADATA=$(echo "$METADATA" | tr -d '\r' | grep -v '^\s*$' | tr -d '\n')
             
             export TAG_NAME=$(echo "$CLEAN_METADATA" | jq -r '.tag_name')
@@ -152,7 +151,7 @@ jobs:
             local ASSET_URLS=$(echo "$CLEAN_METADATA" | jq -r '.asset_urls')
             local TEMP_DIR="assets_${TAG_NAME}"
             
-            # 增加一个检查，确保 ID 和 TAG 已经正确解析
+            # 检查 ID
             if [ -z "$RELEASE_ID" ] || [ "$RELEASE_ID" == "null" ]; then
                 echo "::error::解析 Release ID 失败，跳过同步。原始元数据: $CLEAN_METADATA" >&2
                 return 1
@@ -160,14 +159,12 @@ jobs:
             
             echo "--- 开始同步 ${TAG_NAME} (ID: ${RELEASE_ID}) 的附件 ---" >&2
             
-            # --- 0. 覆盖逻辑：先删除 Gitee 上的旧附件 ---
+            # --- 0. 覆盖逻辑：删除 Gitee 旧附件 ---
             echo "正在清理 Gitee 旧附件..." >&2
             GITEE_ASSETS=$(curl -s -X GET "https://gitee.com/api/v5/repos/${GITEE_OWNER}/${GITEE_REPO}/releases/${RELEASE_ID}/attach_files?access_token=${GITEE_TOKEN}")
             
-            # 使用更安全的 jq 解析来判断是否为空数组
             if echo "$GITEE_ASSETS" | jq -e '. | type == "array" and length > 0' > /dev/null; then
                 echo "$GITEE_ASSETS" | jq -r '.[].id' | while IFS= read -r ASSET_ID; do
-                    # 使用 -s 静默模式，只关注返回码
                     curl -s -X DELETE "https://gitee.com/api/v5/repos/${GITEE_OWNER}/${GITEE_REPO}/releases/${RELEASE_ID}/attach_files/${ASSET_ID}?access_token=${GITEE_TOKEN}" > /dev/null
                 done
                 echo "旧附件清理完成。" >&2
@@ -184,41 +181,44 @@ jobs:
                     if [ -z "$ASSET_URL" ]; then continue; fi
                     local FNAME=$(basename "$ASSET_URL")
                     echo "Downloading $FNAME..." >&2
-                    # 使用导出的环境变量 GITHUB_TOKEN
-                    curl -L -o "${TEMP_DIR}/${FNAME}" -H "Authorization: token ${GITHUB_TOKEN}" "$ASSET_URL"
+                    # 下载时使用 GITHUB_TOKEN
+                    curl -# -L -o "${TEMP_DIR}/${FNAME}" -H "Authorization: token ${GITHUB_TOKEN}" "$ASSET_URL"
                 done
                 
-                find "${TEMP_DIR}" -type f | while IFS= read -r FILE; do
-                    echo "Uploading $FILE..." >&2
-                    RESPONSE=$(curl -# -X POST "https://gitee.com/api/v5/repos/${GITEE_OWNER}/${GITEE_REPO}/releases/${RELEASE_ID}/attach_files" \
-                      -F "access_token=${GITEE_TOKEN}" \
-                      -F "file=@${FILE}")
-                    
-                    if echo "$RESPONSE" | grep -q '"message"'; then
-                        echo "::warning::附件上传失败 ($FILE)，响应：$RESPONSE" >&2
-                        echo "详细响应: $RESPONSE" >&2 # 打印失败的详细响应
-                    fi
-                done
+                # 2. 上传附件
+                upload_file() {
+                  local FILE="$1"
+                  echo "Uploading $FILE..." >&2
+                  RESPONSE=$(curl -# -X POST "https://gitee.com/api/v5/repos/${GITEE_OWNER}/${GITEE_REPO}/releases/${RELEASE_ID}/attach_files" \
+                    -F "access_token=${GITEE_TOKEN}" \
+                    -F "file=@${FILE}")
+                  
+                  if echo "$RESPONSE" | grep -q '"message"'; then
+                      echo "::warning::附件上传失败 ($FILE)，响应：$RESPONSE" >&2
+                  fi
+                  echo "$FILE 上传完成。" >&2
+                }
+                export -f upload_file
+                
+                # 附件并行上传通常能显著提升速度
+                find "${TEMP_DIR}" -type f | parallel -j 5 upload_file
             fi
             
             # 3. 清理
             rm -rf "${TEMP_DIR}"
             echo "--- ${TAG_NAME} 附件同步完成 ---" >&2
         }
-        # 🚨 串行模式下，不需要导出 sync_assets 函数，因为我们是直接在主 Shell 中调用它。
+        export -f sync_assets
 
         # 导出全局变量
         export GITEE_TOKEN=${GITEE_TOKEN}
         export GITEE_OWNER=${GITEE_OWNER}
         export GITEE_REPO=${GITEE_REPO}
-        export GITHUB_TOKEN=${{ secrets.GITHUB_TOKEN }} # 保持导出
+        export GITHUB_TOKEN=${{ secrets.GITHUB_TOKEN }}
 
-        echo "--- 启动附件串行同步 (调试模式) ---"
+        echo "--- 启动附件并行同步 ---"
         
-        # 🚨 关键修改：切换到 while read 循环，强制串行执行，确保实时输出
-        cat "$METADATA_FILE" | tr -d '\r' | grep . | while IFS= read -r METADATA_LINE; do
-            sync_assets "$METADATA_LINE"
-        done
+        cat "$METADATA_FILE" | tr -d '\r' | grep . | parallel -j 5 -u sync_assets "{}"
         
         echo "所有附件同步完成。"
       shell: bash
