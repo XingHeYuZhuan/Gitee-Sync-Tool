@@ -188,16 +188,15 @@ jobs:
                     curl -L -o "${TEMP_DIR}/${FNAME}" -H "Authorization: token ${GITHUB_TOKEN}" "$ASSET_URL"
                 done
                 
-                # 2. 上传附件
-                # 这里不使用 upload_file 子函数和 parallel，而是使用 find 和 while 串行上传
                 find "${TEMP_DIR}" -type f | while IFS= read -r FILE; do
                     echo "Uploading $FILE..." >&2
-                    RESPONSE=$(curl -s -X POST "https://gitee.com/api/v5/repos/${GITEE_OWNER}/${GITEE_REPO}/releases/${RELEASE_ID}/attach_files" \
+                    RESPONSE=$(curl -# -X POST "https://gitee.com/api/v5/repos/${GITEE_OWNER}/${GITEE_REPO}/releases/${RELEASE_ID}/attach_files" \
                       -F "access_token=${GITEE_TOKEN}" \
                       -F "file=@${FILE}")
                     
                     if echo "$RESPONSE" | grep -q '"message"'; then
                         echo "::warning::附件上传失败 ($FILE)，响应：$RESPONSE" >&2
+                        echo "详细响应: $RESPONSE" >&2 # 打印失败的详细响应
                     fi
                 done
             fi
