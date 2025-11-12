@@ -81,8 +81,7 @@ jobs:
           html_url=$(echo "$RELEASE_INFO" | jq -r '.html_url')
           prerelease=$(echo "$RELEASE_INFO" | jq -r '.prerelease')
           
-          RELEASE_BODY="${body}  \
-          **GitHub Release:** ${html_url}"
+          RELEASE_BODY="${body}
           
           GITEE_RELEASE_ID="${SYNCED_TAG_MAP[$TAG]}"
 
@@ -136,7 +135,7 @@ jobs:
         echo "metadata_file=$METADATA_FILE" >> $GITHUB_OUTPUT
       shell: bash
 
-    - name: 阶段二：并行下载和上传附件 (包含覆盖逻辑)
+    - name: 阶段二：串行下载和上传附件 (调试模式)
       if: steps.creation_phase.outputs.metadata_file != 'SKIP'
       run: |
         METADATA_FILE="${{ steps.creation_phase.outputs.metadata_file }}"
@@ -145,6 +144,7 @@ jobs:
             local METADATA="$1"
             
             # 增加对元数据参数的清理，以防万一
+            # 串行模式下不需要太多清理，但保留以确保健壮性
             local CLEAN_METADATA=$(echo "$METADATA" | tr -d '\r' | grep -v '^\s*$' | tr -d '\n')
             
             export TAG_NAME=$(echo "$CLEAN_METADATA" | jq -r '.tag_name')
@@ -184,44 +184,42 @@ jobs:
                     if [ -z "$ASSET_URL" ]; then continue; fi
                     local FNAME=$(basename "$ASSET_URL")
                     echo "Downloading $FNAME..." >&2
-                    # 🚨 关键修改 2：使用导出的环境变量 GITHUB_TOKEN
+                    # 使用导出的环境变量 GITHUB_TOKEN
                     curl -L -o "${TEMP_DIR}/${FNAME}" -H "Authorization: token ${GITHUB_TOKEN}" "$ASSET_URL"
                 done
                 
                 # 2. 上传附件
-                upload_file() {
-                  local FILE="$1"
-                  echo "Uploading $FILE..." >&2
-                  # RELEASE_ID 已经通过 export 确保在 parallel 的子 shell 中可用
-                  RESPONSE=$(curl -s -X POST "https://gitee.com/api/v5/repos/${GITEE_OWNER}/${GITEE_REPO}/releases/${RELEASE_ID}/attach_files" \
-                    -F "access_token=${GITEE_TOKEN}" \
-                    -F "file=@${FILE}")
-                  
-                  if echo "$RESPONSE" | grep -q '"message"'; then
-                      echo "::warning::附件上传失败 ($FILE)，响应：$RESPONSE" >&2
-                  fi
-                }
-                export -f upload_file
-                
-                # 使用 GNU parallel 对该 Release 的所有附件进行并行上传
-                find "${TEMP_DIR}" -type f | parallel -j 5 upload_file
+                # 这里不使用 upload_file 子函数和 parallel，而是使用 find 和 while 串行上传
+                find "${TEMP_DIR}" -type f | while IFS= read -r FILE; do
+                    echo "Uploading $FILE..." >&2
+                    RESPONSE=$(curl -s -X POST "https://gitee.com/api/v5/repos/${GITEE_OWNER}/${GITEE_REPO}/releases/${RELEASE_ID}/attach_files" \
+                      -F "access_token=${GITEE_TOKEN}" \
+                      -F "file=@${FILE}")
+                    
+                    if echo "$RESPONSE" | grep -q '"message"'; then
+                        echo "::warning::附件上传失败 ($FILE)，响应：$RESPONSE" >&2
+                    fi
+                done
             fi
             
             # 3. 清理
             rm -rf "${TEMP_DIR}"
             echo "--- ${TAG_NAME} 附件同步完成 ---" >&2
         }
-        export -f sync_assets
+        # 🚨 串行模式下，不需要导出 sync_assets 函数，因为我们是直接在主 Shell 中调用它。
 
-        # 导出全局变量供 parallel 的子 shell 使用
+        # 导出全局变量
         export GITEE_TOKEN=${GITEE_TOKEN}
         export GITEE_OWNER=${GITEE_OWNER}
         export GITEE_REPO=${GITEE_REPO}
-        export GITHUB_TOKEN=${{ secrets.GITHUB_TOKEN }}
+        export GITHUB_TOKEN=${{ secrets.GITHUB_TOKEN }} # 保持导出
 
-        echo "--- 启动附件并行同步 ---"
-        # 使用 tr -d '\r' 清理 Windows 换行符，使用 grep . 过滤空行
-        cat "$METADATA_FILE" | tr -d '\r' | grep . | parallel -j 5 sync_assets "{}"
+        echo "--- 启动附件串行同步 (调试模式) ---"
+        
+        # 🚨 关键修改：切换到 while read 循环，强制串行执行，确保实时输出
+        cat "$METADATA_FILE" | tr -d '\r' | grep . | while IFS= read -r METADATA_LINE; do
+            sync_assets "$METADATA_LINE"
+        done
         
         echo "所有附件同步完成。"
       shell: bash
