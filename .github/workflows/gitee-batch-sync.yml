@@ -32,7 +32,7 @@ jobs:
         SOURCE_GH_FULL_REPO="${SOURCE_GH_OWNER}/${SOURCE_GH_REPO_NAME}"
         
         # 获取 Gitee 已有的 Release 标签和 ID
-        GITEE_RELEASES=$(curl -s -X GET "https://gitee.com/api/v5/repos/${GITEE_OWNER}/${GITEE_REPO}/releases?access_token=${GITEE_TOKEN}&per_page=100" | jq -r '.[].tag_name') # 修复了上一轮的 ID 提取方式，只提取 tag name 用于映射
+        GITEE_RELEASES=$(curl -s -X GET "https://gitee.com/api/v5/repos/${GITEE_OWNER}/${GITEE_REPO}/releases?access_token=${GITEE_TOKEN}&per_page=100" | jq -r '.[].tag_name') 
         
         declare -A SYNCED_TAG_MAP
         # 建立标签到 Gitee Release ID 的映射 (重新提取所有信息，避免解析问题)
@@ -81,8 +81,8 @@ jobs:
           html_url=$(echo "$RELEASE_INFO" | jq -r '.html_url')
           prerelease=$(echo "$RELEASE_INFO" | jq -r '.prerelease')
           
-          RELEASE_BODY="${body} \
-          \n\n**GitHub Release:** ${html_url}"
+          RELEASE_BODY="${body}  \
+          **GitHub Release:** ${html_url}"
           
           GITEE_RELEASE_ID="${SYNCED_TAG_MAP[$TAG]}"
 
@@ -124,7 +124,8 @@ jobs:
           ASSET_URLS=$(echo "$RELEASE_INFO" | jq -r '[.assets[] | .browser_download_url] | join("|")')
           
           # 将元数据写入文件供下一阶段并行使用
-          jq -n \
+          # 🚨 修正：使用 -c 选项强制输出紧凑的单行 JSON
+          jq -n -c \
             --arg tag "$tag_name" \
             --arg id "$GITEE_RELEASE_ID" \
             --arg urls "$ASSET_URLS" \
@@ -142,15 +143,18 @@ jobs:
         
         sync_assets() {
             local METADATA="$1"
-            # 这里的 jq 应该能够正确解析，因为它收到了一个干净的 JSON 字符串
-            export TAG_NAME=$(echo "$METADATA" | jq -r '.tag_name')
-            export RELEASE_ID=$(echo "$METADATA" | jq -r '.gitee_id')
-            local ASSET_URLS=$(echo "$METADATA" | jq -r '.asset_urls')
+            
+            # 🚨 修正：增加对元数据参数的清理，以防万一
+            local CLEAN_METADATA=$(echo "$METADATA" | tr -d '\r' | grep -v '^\s*$' | tr -d '\n')
+            
+            export TAG_NAME=$(echo "$CLEAN_METADATA" | jq -r '.tag_name')
+            export RELEASE_ID=$(echo "$CLEAN_METADATA" | jq -r '.gitee_id')
+            local ASSET_URLS=$(echo "$CLEAN_METADATA" | jq -r '.asset_urls')
             local TEMP_DIR="assets_${TAG_NAME}"
             
-            # 🚨 增加一个检查，确保 ID 和 TAG 已经正确解析
+            # 增加一个检查，确保 ID 和 TAG 已经正确解析
             if [ -z "$RELEASE_ID" ] || [ "$RELEASE_ID" == "null" ]; then
-                echo "::error::解析 Release ID 失败，跳过同步。原始元数据: $METADATA" >&2
+                echo "::error::解析 Release ID 失败，跳过同步。原始元数据: $CLEAN_METADATA" >&2
                 return 1
             fi
             
@@ -158,6 +162,7 @@ jobs:
             
             # --- 0. 覆盖逻辑：先删除 Gitee 上的旧附件 ---
             echo "正在清理 Gitee 旧附件..." >&2
+            # 确保 RELEASE_ID 被正确使用
             GITEE_ASSETS=$(curl -s -X GET "https://gitee.com/api/v5/repos/${GITEE_OWNER}/${GITEE_REPO}/releases/${RELEASE_ID}/attach_files?access_token=${GITEE_TOKEN}")
             
             # 使用更安全的 jq 解析来判断是否为空数组
@@ -215,7 +220,7 @@ jobs:
         export GITEE_REPO=${GITEE_REPO}
 
         echo "--- 启动附件并行同步 ---"
-        # 🚨 修正：清理换行符和空行，确保 parallel 接收到干净的 JSON 行
+        # 使用 tr -d '\r' 清理 Windows 换行符，使用 grep . 过滤空行
         cat "$METADATA_FILE" | tr -d '\r' | grep . | parallel -j 5 sync_assets "{}"
         
         echo "所有附件同步完成。"
